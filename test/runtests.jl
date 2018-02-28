@@ -1,102 +1,77 @@
 using XGBoost
-using Base.Test
+using FactCheck
 
-# we load in the agaricus dataset
-# In this example, we are aiming to predict whether a mushroom can be eated
-function readlibsvm(fname::ASCIIString, shape)
-    dmx = zeros(Float32, shape)
-    label = Float32[]
-    fi = open(fname, "r")
-    cnt = 1
-    for line in eachline(fi)
-        line = split(line, " ")
-        push!(label, float(line[1]))
-        line = line[2:end]
-        for itm in line
-            itm = split(itm, ":")
-            dmx[cnt, parse(Int, itm[1]) + 1] = float(parse(Int, itm[2]))
-        end
-        cnt += 1
-    end
-    close(fi)
-    return (dmx, label)
+include("utils.jl")
+
+
+facts("Sparse matrices") do
+    X = sparse(randn(100,10) .* bitrand(100,10))
+    y = randn(100)
+    DMatrix(X, label = y)
+
+    X = sparse(convert(Matrix{Float32}, randn(10,100) .* bitrand(10,100)))
+    y = randn(100)
+    DMatrix(X, true)
+
+    X = sparse(randn(100,10) .* bitrand(100,10))
+    y = randn(100)
+    DMatrix(X)
 end
 
-# we use auxiliary function to read LIBSVM format into julia Matrix
-train_X, train_Y = readlibsvm("../data/agaricus.txt.train", (6513, 126))
-test_X, test_Y = readlibsvm("../data/agaricus.txt.test", (1611, 126))
+facts("DMatrix loading") do
+    dtrain = DMatrix("../data/agaricus.txt.train")
+    train_X, train_Y = readlibsvm("../data/agaricus.txt.train", (6513, 126))
+    @fact dtrain --> not(nothing)
 
-#-------------Basic Training using XGBoost-----------------
-# note: xgboost naturally handles sparse input
-# use sparse matrix when your feature is sparse(e.g. when you using one-hot encoding vector)
-# model paramters can be set as paramter for ```xgboost``` function, or use an Array{(ASCIIString, Any), 1}/Dict()
-num_round = 2
+    labels = get_info(dtrain, "label")
 
-print("training xgboost with dense matrix\n")
-# you can directly pass julia's matrix or sparse matrix as data,
-#   by calling xgboost(data, num_round, label=label, training-parameters)
-bst = xgboost(train_X, num_round, label = train_Y, eta=1, max_depth=2, objective="binary:logistic")
+    @fact train_Y --> labels
+end
 
+facts("Agaricus training") do
+    dtrain = DMatrix("../data/agaricus.txt.train")
+    dtest = DMatrix("../data/agaricus.txt.test")
+    watchlist = [(dtest, "eval"), (dtrain, "train")]
 
-print("training xgboost with sparse matrix\n")
-sptrain = sparse(train_X)
-# alternatively, you can pass parameters in as a map
-param = Dict("max_depth"=>2, "eta"=>1, "objective"=>"binary:logistic")
-bst = xgboost(sptrain, num_round, label = train_Y, param=param)
+    bst = xgboost(dtrain, 2, watchlist=watchlist, eta = 1, max_depth = 2,
+                  objective = "binary:logistic", silent = 1)
+    @fact bst --> not(nothing)
 
-# you can also put in xgboost's DMatrix object
-# DMatrix stores label, data and other meta datas needed for advanced features
-print("training xgboost with DMatrix")
-dtrain = DMatrix(train_X, label = train_Y)
-bst = xgboost(dtrain, num_round, eta = 1, objective = "binary:logistic")
+    preds = XGBoost.predict(bst, dtest)
 
-# you can also specify data as file path to a LibSVM format input
-bst = xgboost("../data/agaricus.txt.train", num_round, max_depth = 2, eta = 1, objective = "binary:logistic")
+    labels = get_info(dtest, "label")
+    @fact size(preds) --> size(labels)
 
-#--------------------basic prediction using XGBoost--------------
-# you can do prediction using the following line
-# you can put in Matrix, SparseMatrix or DMatrix
-preds = predict(bst, test_X)
-print("test-error=", sum((preds .> 0.5) .!= test_Y) / float(size(preds)[1]), "\n")
+    err = countnz((preds .> 0.5) .!= labels) / length(preds)
+    @fact err --> less_than(0.1)
+end
 
-#-------------------save and load models-------------------------
-# save model to binary local file
-save(bst, "xgb.model")
-# load binary model to julia
-bst2 = Booster(model_file = "xgb.model")
-preds2 = predict(bst2, test_X)
-print("sum(abs(pred2-pred))=", sum(abs(preds2 .- preds)), "\n")
+facts("Cross validation") do
+    dtrain = DMatrix("../data/agaricus.txt.train")
+    dtest = DMatrix("../data/agaricus.txt.test")
+    watchlist = [(dtest, "eval"), (dtrain, "train")]
 
-#----------------Advanced features --------------
-# to use advanced features, we need to put data in xgb.DMatrix
-dtrain = DMatrix(train_X, label = train_Y)
-dtest = DMatrix(test_X, label = test_Y)
+    bst = nfold_cv(dtrain, 5, 3, eta = 1, max_depth = 2, objective = "binary:logistic", silent = 1,
+                   seed = 12345)
+    # important_features = importance(bst)
+    #
+    # @fact startswith(important_features[1].fname, "f28") --> true
+    # @pending important_features[1].fname --> "f28"
+end
 
-#---------------Using watchlist----------------
-# watchlist is a list of DMatrix, each of them tagged with name
-# DMatrix in watchlist should have label (for evaluation)
-watchlist  = [(dtest,"eval"), (dtrain,"train")]
-# we can change evaluation metrics, or use multiple evaluation metrics
-bst = xgboost(dtrain, num_round, param=param, watchlist=watchlist, metrics=["logloss", "error"])
+facts("Feature importance") do
+    dtrain = DMatrix("../data/agaricus.txt.train")
+    dtest = DMatrix("../data/agaricus.txt.test")
+    watchlist = [(dtest, "eval"), (dtrain, "train")]
 
-# we can also save DMatrix into binary file, then we can load it faster next time
-save(dtest, "dtest.buffer")
-save(dtrain, "dtrain.buffer")
+    bst = xgboost(dtrain, 5, watchlist = watchlist, eta = 1, max_depth = 2,
+                  objective = "binary:logistic", silent = 1, seed = 12345)
+    important_features = importance(bst)
 
-# load model and data in
-dtrain = DMatrix("dtrain.buffer")
-dtest = DMatrix("dtest.buffer")
-bst = Booster(model_file = "xgb.model")
+    @fact startswith(important_features[1].fname, "f28") --> true
+    @pending important_features[1].fname --> "f28"
+end
 
-# information can be extracted from DMatrix using get_info
-label = get_info(dtest, "label")
-pred = predict(bst, dtest)
-print("test-error=", sum((pred .> 0.5) .!= label) / float(size(pred)[1]), "\n")
-
-# You can dump the tree you learned using dump_model into a text file
-dump_model(bst, "dump.raw.txt")
-# If you have feature map file, you can dump the model in a more readable way
-dump_model(bst, "dump.nice.txt", fmap="../data/featmap.txt", with_stats=true)
-
-# You can also get information about feature importances in the model
-dump(importance(bst, fmap="../data/featmap.txt"))
+facts("Example is running") do
+    include("example.jl")
+end
